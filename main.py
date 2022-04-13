@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from operator import attrgetter
 from subprocess import check_call
+from typing import Optional
 
 
 @dataclass
@@ -121,10 +122,93 @@ def defrag(pv_name: str) -> bool:
     return False
 
 
+def move_tail_pe(pv_name: str, required_bytes: Optional[int] = None) -> bool:
+    # Wait and report any movements
+    log.info('Waiting for move operation to complete.')
+    check_call(['pvmove'])
+    log.info('Complete. Inspecting state.')
+
+    extent_size = int(json.loads(
+        subprocess.check_output([
+            'pvs',
+            '-ovg_extent_size',
+            '--units', 'B',
+            '--reportformat=json',
+            pv_name,
+        ])
+    )['report'][0]['pv'][0]['vg_extent_size'].removesuffix('B'), 10)
+
+    assert extent_size > 4096
+
+    free: list[Pvseg] = []
+    used: list[Pvseg] = []
+
+    for pvseg_ in json.loads(
+            subprocess.check_output([
+                'pvs',
+                '--segments',
+                '-ovg_name,lv_name,pvseg_start,seg_start_pe,seg_size_pe,segtype',
+                '--reportformat=json',
+                pv_name,
+            ])
+    )['report'][0]['pvseg']:
+        lvm_seg = Pvseg(
+            vg_name=pvseg_['vg_name'],
+            lv_name=pvseg_['lv_name'],
+            pvseg_start=int(pvseg_['pvseg_start']),
+            seg_start_pe=int(pvseg_['seg_start_pe']),
+            seg_size_pe=int(pvseg_['seg_size_pe']),
+            segtype=pvseg_['segtype'],
+        )
+        if lvm_seg.segtype == 'free':
+            free.append(lvm_seg)
+        elif lvm_seg.segtype == 'linear':
+            used.append(lvm_seg)
+        else:
+            raise RuntimeError(f'Unknown segment type {lvm_seg.segtype!r}.')
+
+    if not used:
+        return False
+    if not free:
+        return False
+
+    free.sort(key=attrgetter('pvseg_start'))
+    used.sort(key=attrgetter('pvseg_start'))
+
+    # Когда первое же свободное место есть только ПОСЛЕ последнего сегмента.
+    if free[0].seg_start_pe > used[-1].seg_start_pe:
+        assert len(free) == 1
+        return False
+
+    # 0   seg -> 0 seg
+    # 1   seg -> 1 seg
+    # 1.1 seg -> 2 seg
+    # 5   seg -> 5 seg
+    to_move = min(free[0].seg_size_pe, used[-1].seg_size_pe)
+    log.info('Can move %d extents (%d bytes).', to_move, to_move * extent_size)
+    if required_bytes is not None:
+        to_move = (min(to_move * extent_size, required_bytes) + extent_size - 1) // extent_size
+        log.info('Limiting data move as requested (%d) to %d segments (%d bytes)', required_bytes, to_move, to_move * extent_size)
+
+    if not to_move:
+        log.warning('Attempt to move zero extents.')
+        return False
+
+    log.info('Moving %d extents.', to_move)
+    check_call([
+        'pvmove', '-b', '--atomic',
+        '--alloc', 'anywhere',
+        f'{pv_name}:{used[-1].pvseg_start + used[-1].seg_size_pe - to_move}+{to_move}',
+        f'{pv_name}:{free[0].pvseg_start}+{to_move}',
+    ])
+    return True
+
+
 def main():
     logging.basicConfig(level=logging.DEBUG)
-    while defrag('/dev/vda3'):
-        pass
+    # while defrag('/dev/mapper/luks-c884632a-a484-4f1a-a3c3-469a4bbb9ba3'):
+    #     pass
+    move_tail_pe('/dev/mapper/luks-c884632a-a484-4f1a-a3c3-469a4bbb9ba3')
 
 
 if __name__ == '__main__':
